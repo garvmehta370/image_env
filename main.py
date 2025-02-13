@@ -7,8 +7,8 @@ import openai
 import clip
 import requests
 from io import BytesIO
-from dotenv import load_dotenv
 import os
+from dotenv import load_dotenv
 
 # Import SAM2 modules from the official Segment Anything repository.
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
@@ -28,27 +28,14 @@ class ImageTransformer:
                  text_prompt="all objects",
                  box_threshold=0.3,
                  text_threshold=0.25,
-                 sam_checkpoint="sam2/sam_vit_h_4b8939.pth",  # Update to your SAM2 checkpoint.
+                 sam_checkpoint="sam2/sam_vit_h_4b8939.pth",
                  sam_model_type="vit_h",
-                 grounddino_config="GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",  # Update path.
-                 grounddino_checkpoint="GroundingDINO/groundingdino/groundingdino_swint_ogc.pth",  # Update path.
-                 device=None):
+                 grounddino_config="GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+                 grounddino_checkpoint="GroundingDINO/groundingDINO/groundingdino_swint_ogc.pth"
+                 ):
         """
-        Initialize the transformer.
-        
-        Args:
-          - desired_scale_ratio (float): Fraction of the candidate region’s width that the product should occupy.
-          - product_description (str): Description of the product and its typical placement.
-          - target_region (str): Keyword (e.g., "counter") to help select the region from the scene graph.
-          - text_prompt (str): Text query used with GroundingDINO.
-          - box_threshold, text_threshold (float): Detection thresholds for GroundingDINO.
-          - sam_checkpoint, sam_model_type: Parameters for SAM2.
-          - grounddino_config, grounddino_checkpoint: Parameters for GroundingDINO.
-          - device (str): 'cuda' or 'cpu' (if None, uses GPU if available).
+        Initialize the transformer for execution.
         """
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = device
         self.desired_scale_ratio = desired_scale_ratio
         self.product_description = product_description
         self.target_region = target_region.lower()
@@ -62,17 +49,17 @@ class ImageTransformer:
         # Load SAM2 model.
         logging.info("Loading SAM2 model...")
         self.sam = sam_model_registry[sam_model_type](checkpoint=sam_checkpoint)
-        self.sam.to(device=device)
+        self.sam.to(device=self.device)
         self.mask_generator = SamAutomaticMaskGenerator(self.sam)
 
         # Load GroundingDINO model.
         logging.info("Loading GroundingDINO model...")
-        self.grounddino_model = load_model(grounddino_config, grounddino_checkpoint, device=device)
+        self.grounddino_model = load_model(grounddino_config, grounddino_checkpoint)
+        self.grounddino_model.to(device=self.device)  # Explicitly move to CPU
 
         # Load CLIP model for semantic matching.
-        logging.info("Loading CLIP model...")
-        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=device)
-        self.clip_model.to(device)
+        logging.info("Loading CLIP model on CPU...")
+        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
         self.product_text_embedding = self.get_text_embedding(self.product_description)
 
     def get_text_embedding(self, text):
@@ -101,16 +88,26 @@ class ImageTransformer:
         Runs GroundingDINO detection on the provided RGB image (numpy array).
         Returns bounding boxes and phrases.
         """
-        logging.info("Running GroundingDINO detection...")
-        boxes, scores, phrases = predict(
-            self.grounddino_model,
-            image_np,
-            self.text_prompt,
-            self.box_threshold,
-            self.text_threshold
-        )
-        logging.info(f"GroundingDINO found {len(boxes)} box(es).")
-        return boxes, phrases
+        logging.info("Running GroundingDINO detection on CPU...")
+        image_np = np.ascontiguousarray(image_np)
+        image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        image_tensor = torch.from_numpy(image_bgr.transpose(2, 0, 1)).float()
+        image_tensor = image_tensor / 255.0
+        image_tensor = image_tensor.unsqueeze(0)
+        try:
+            boxes, scores, phrases = predict(
+                model=self.grounddino_model,
+                image=image_tensor,
+                caption=self.text_prompt,
+                box_threshold=self.box_threshold,
+                text_threshold=self.text_threshold
+            )
+            logging.info(f"GroundingDINO found {len(boxes)} box(es).")
+            return boxes, phrases
+        except Exception as e:
+            logging.error(f"GroundingDINO detection failed: {e}")
+            # Return empty results as fallback
+            return np.array([]), []
 
     def generate_scene_graph(self, image_np):
         """
@@ -151,8 +148,10 @@ class ImageTransformer:
         
         logging.info("Sending prompt to OpenAI for scene graph optimization...")
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
+            client = openai.OpenAI()
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=10
@@ -276,7 +275,7 @@ def load_image_from_url(url):
 def main():
     try:
         background_url = "https://media.istockphoto.com/id/1428205261/photo/modern-and-luxury-beige-wooden-kitchen-island-and-counter-with-white-counter-top-and-glass.jpg?s=1024x1024&w=is&k=20&c=FsuVhUadeD-d25JHBUotOsm15n7LXraejiSAsqvs0pE="
-        product_url = "https://media.istockphoto.com/id/1406569643/vector/drip-coffee-maker-3d-vector-illustration-realistic-coffee-machine-isolated-on-transparent.jpg?s=1024x1024&w=is&k=20&c=WKAx_RiL9FxztS1SMpKA9KJVGzDBhjwJ3dnctab63D8="
+        product_url = "https://image.similarpng.com/file/similarpng/very-thumbnail/2020/08/Espresso-coffee-machine-on-transparent-background-PNG.png"
         background = load_image_from_url(background_url).convert("RGBA")
         product = load_image_from_url(product_url).convert("RGBA")
     except Exception as e:
@@ -284,9 +283,12 @@ def main():
         return
 
     # Update the following paths as needed.
-    sam_checkpoint = "sam2/sam_vit_h_4b8939.pth"
-    grounddino_config = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-    grounddino_checkpoint = "GroundingDINO/groundingdino/groundingdino_swint_ogc.pth"
+    sam_checkpoint = os.path.join("sam2", "sam_vit_h_4b8939.pth")
+    grounddino_config = os.path.join("GroundingDINO", "groundingdino", "config", "GroundingDINO_SwinT_OGC.py")
+    grounddino_checkpoint = os.path.join("GroundingDINO", "groundingDINO", "groundingdino_swint_ogc.pth")
+
+    if not os.path.exists(sam_checkpoint):
+        raise FileNotFoundError(f"SAM checkpoint not found at: {sam_checkpoint}")
 
     transformer = ImageTransformer(
         desired_scale_ratio=0.8,
@@ -300,6 +302,7 @@ def main():
         grounddino_config=grounddino_config,
         grounddino_checkpoint=grounddino_checkpoint
     )
+    
     final_image = process_images(background, product, transformer)
     try:
         final_image.save("final_composite.png")
